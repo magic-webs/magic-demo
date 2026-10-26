@@ -1,0 +1,19 @@
+# Self-hosted browser worker. Deploy on any long-running container host
+# (Fly.io, Railway, Render, a VPS). Not for serverless.
+# The Playwright image ships Chromium and its system dependencies.
+FROM mcr.microsoft.com/playwright:v1.64.1-noble
+
+WORKDIR /app
+COPY package.json bun.lock tsconfig.json ./
+RUN npm install -g bun@1.4.2 && bun install --frozen-lockfile
+COPY worker ./worker
+COPY lib/browser ./lib/browser
+
+ENV WORKER_HOST=0.0.0.0 \
+    WORKER_PORT=8787 \
+    WORKER_NO_SANDBOX=true \
+    NODE_ENV=production
+EXPOSE 8787
+
+# BROWSER_WORKER_SECRET must be provided by the host's secret manager.
+CMD ["npx", "tsx", "worker/index.ts"]
