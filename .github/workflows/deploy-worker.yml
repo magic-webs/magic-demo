@@ -1,0 +1,93 @@
+# Builds Dockerfile.worker and deploys it to Cloud Run.
+# One-time GCP setup (APIs, Artifact Registry, secret, Workload Identity) is in
+# DEPLOY_WORKER_GCP.md (local, gitignored).
+name: Deploy browser worker (GCP)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - worker/**
+      - lib/browser/**
+      - Dockerfile.worker
+      - package.json
+      - bun.lock
+      - .github/workflows/deploy-worker.yml
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: ${{ vars.GCP_REGION }}
+  REPOSITORY: ${{ vars.GCP_ARTIFACT_REPO || 'magic-demo' }}
+  SERVICE: ${{ vars.WORKER_SERVICE_NAME || 'magic-browser-worker' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Workload Identity Federation (no JSON keys)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - name: Build image
+        run: |
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${SERVICE}"
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+          docker build -f Dockerfile.worker -t "${IMAGE}:${GITHUB_SHA}" -t "${IMAGE}:latest" .
+
+      - name: Push image
+        run: docker push --all-tags "${IMAGE}"
+
+      # Browsers live in the worker's memory, so this runs exactly one instance
+      # that is always on (min = max = 1, CPU not throttled between requests).
+      # The live view and CDP use WebSockets, kept open for up to 60 minutes.
+      # Auth is the worker's own BROWSER_WORKER_SECRET, so the service is public.
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "${SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --image "${IMAGE}:${GITHUB_SHA}" \
+            --service-account "${{ vars.WORKER_RUNTIME_SERVICE_ACCOUNT }}" \
+            --execution-environment gen2 \
+            --port 8787 \
+            --cpu 2 \
+            --memory 2Gi \
+            --min-instances 1 \
+            --max-instances 1 \
+            --no-cpu-throttling \
+            --session-affinity \
+            --timeout 3600 \
+            --concurrency 80 \
+            --allow-unauthenticated \
+            --set-env-vars "WORKER_HOST=0.0.0.0,WORKER_PORT=8787,WORKER_NO_SANDBOX=true,WORKER_MAX_SESSIONS=${{ vars.WORKER_MAX_SESSIONS || '3' }},WORKER_IDLE_SECONDS=${{ vars.WORKER_IDLE_SECONDS || '600' }}" \
+            --set-secrets "BROWSER_WORKER_SECRET=browser-worker-secret:latest"
+
+      - name: Health check
+        run: |
+          URL=$(gcloud run services describe "${SERVICE}" --project "${PROJECT_ID}" --region "${REGION}" --format 'value(status.url)')
+          echo "Worker URL: ${URL}"
+          for i in 1 2 3 4 5 6; do
+            if curl -fsS "${URL}/health"; then echo; exit 0; fi
+            sleep 10
+          done
+          echo "Worker did not pass /health" >&2
+          exit 1
